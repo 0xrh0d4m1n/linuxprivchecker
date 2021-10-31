@@ -4,7 +4,7 @@
 ## [Author]: Mike Merrill (linted) -- https://github.com/linted
 ##-------------------------------------------------------------------------------------------------------------
 ## [Details]:
-## This script is intended to be executed remotely to enumerate search for common privilege escalation  
+## This script is intended to be executed remotely to enumerate search for common privilege escalation
 ## exploits found in exploit-db's database
 ##-------------------------------------------------------------------------------------------------------------
 ## [Warning]:
@@ -30,91 +30,112 @@ try:
     import socketserver
     from os.path import isfile
     import argparse
-    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
     from csv import DictReader
+    import asyncio
+    from typing import List, OrderedDict, ByteString
 except Exception as e:
     print("Caught exception: {}\nAre you running with python3?".format(e))
     exit(1)
 
 
 _PORT_ = 4521
-_IP_ = '0.0.0.0'
+_IP_ = "0.0.0.0"
 _SEARCHSPLOIT_ = "/usr/share/exploitdb/files_exploits.csv"
 
-class SearchHandler(socketserver.StreamRequestHandler):
-    def handle(self):
-        try:
-            print('[+] Connection from '+ self.client_address[0])
-            self.pool = multiprocessing.Pool(10)
-            for output in self.pool.imap(SearchHandler.search, iter(self.rfile.readline, b'\n')):
-                if output:
-                    print(output)
-                    self.wfile.write(output.encode() + b'\n')
-                
-            self.pool.close()
-            print('[$] Closing connection from {}\n'.format(self.client_address[0]))
-            self.pool.join()
-        except Exception as e:
-            self.pool.terminate()
-            self.wfile.write('[-] Exception Caught: {}'.format(e).encode())
-            print("[-] Exception Caught: {}".format(e))
-            self.pool.join()
 
-    @classmethod
-    def search(cls, data):
+class SearchHandler():
+    def __init__(self, database) -> None:
+        self.db = database
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        remote_addr = "{}:{}".format(*writer.get_extra_info('peername'))
+        print("[$] Connection from {}".format(remote_addr) )
+        loop = asyncio.get_running_loop()
+        with ProcessPoolExecutor() as pool:
+            futures = []
+            while True: # this is how they do it in the docs... smh
+                line = await reader.readline()
+                if not line:
+                    break
+                print("[ ] checking line: '{!r}'".format(line))
+                futures.append(loop.run_in_executor(pool, self.search, line))
+            
+            if not futures:
+                print("[-] No data received from {}".format(remote_addr))
+
+            done,_ = await asyncio.wait(futures)
+
+        for task in done:
+            exception = task.exception()
+            if exception:
+                print("[-] Error: {}".format(exception))
+                writer.write("[-] Error: {}".format(exception).encode())
+            else:
+                res = task.result()
+                if res:
+                    print(res.decode())
+                    writer.write(res)
+
+        print("[$] Closing connection from {}".format(remote_addr))
+        await writer.drain()
+        writer.close()
+
+
+    def search(self, data: ByteString) -> ByteString:
         query = data.decode().strip().split(" ")
-        query[-1] = query[-1][:3] #cut down on the last item which should be the version number
+        query[-1] = query[-1][:3]  # cut down on the last item which should be the version number
         output = []
-        for rows in ExploitServer.exploitDatabase:
+        for rows in self.db:
             if all([term in rows["description"] for term in query]):
-                output.append('\t'.join((rows["description"], rows["file"])))
+                output.append("\t".join((rows["description"], rows["file"])))
         if output:
-            return "[ ] " + "\n".join([' '.join(query), *output])
+            return ("[+] {}\n".format(data.decode().strip()) + "\n".join(output)).encode()
+        return b''
 
 
+async def start_server(ip, port, database):
+    handler = SearchHandler(database)
+    server = await asyncio.start_server(handler.handle, ip, port)
+    print("[+] Listening on {}:{}".format(ip, port))
 
-class ExploitServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-   exploitDatabase = []
-    
+    async with server:
+        await server.serve_forever()
+
 
 def main():
-    exploit = ExploitServer((_IP_, _PORT_), SearchHandler)
-    print('[ ] Starting server on port ' + str(_PORT_))
-    try:
-        exploit.serve_forever()
-    except:
-        print('[-] Caught exception. Shutting down.')
-        exploit.shutdown()
-        exploit.server_close()
-    
-if __name__ == "__main__":
-    #parse the args
     parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--ip", help="Ip to listen on")
-    parser.add_argument("-p", "--port", help="Port to listen on")
-    parser.add_argument("-f", "--file", help="The exploit csv to use")
+    parser.add_argument("-i", "--ip", help="Ip to listen on", default=_IP_)
+    parser.add_argument("-p", "--port", help="Port to listen on", default=_PORT_)
+    parser.add_argument("-f", "--file", help="The exploit csv to use", default=_SEARCHSPLOIT_)
     args = parser.parse_args()
-    if args.ip:
-        _IP_ = args.ip
-    if args.port:
-        _PORT_ = args.port
-    if args.file:
-        _SEARCHSPLOIT_ = args.file
-
-    if not isfile(_SEARCHSPLOIT_):
-        print("[-] Cannot find csv databse: {}\nFor more details visit: https://github.com/offensive-security/exploit-database".format(_SEARCHSPLOIT_))
-        exit(2)
-
-       #parse the exploit database and collect all the results
-    try:
-        with open(_SEARCHSPLOIT_) as Fin:
-            reader = DictReader(Fin)
-            for lines in reader:
-                #add the database to the exploit server for non global persistance... or maybe it is technically still global?
-                ExploitServer.exploitDatabase.append(lines)
-    except Exception as e:
-        print("[-] Exception caught while attempting to parse database file. {}".format(e))
-        exit(3)
 
     print("[ ] Starting up")
+    database = parse_exploitdb(args.file)
+    asyncio.run(start_server(args.ip, args.port, database))
+
+def parse_exploitdb(path: str) -> List[OrderedDict[str,str]]:
+    database = []
+    if not isfile(path):
+        raise FileNotFoundError(
+            "[-] Cannot find csv database at {}\nFor more details visit: https://github.com/offensive-security/exploit-database".format(
+                path
+            )
+        )
+
+    # parse the exploit database and collect all the results
+    try:
+        with open(path, 'r') as Fin:
+            reader = DictReader(Fin)
+            for lines in reader:
+                # add the database to the exploit server for non global persistance
+                database.append(lines)
+    except Exception as e:
+        raise AttributeError(
+            "[-] Exception caught while attempting to parse database file. {}".format(e)
+        )
+    return database
+
+if __name__ == "__main__":
+    # parse the args
     main()
