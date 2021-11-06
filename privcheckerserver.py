@@ -27,10 +27,9 @@
 ###############################################################################################################
 
 try:
-    import socketserver
     from os.path import isfile
     import argparse
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor
     from csv import DictReader
     import asyncio
     from typing import List, OrderedDict, ByteString
@@ -52,18 +51,20 @@ class SearchHandler():
         remote_addr = "{}:{}".format(*writer.get_extra_info('peername'))
         print("[$] Connection from {}".format(remote_addr) )
         loop = asyncio.get_running_loop()
-        with ProcessPoolExecutor() as pool:
+
+        with ThreadPoolExecutor() as pool:
             futures = []
             while True: # this is how they do it in the docs... smh
                 line = await reader.readline()
-                if not line:
+                if line.strip() == b'':
+                    print("[$] received all")
                     break
-                print("[ ] checking line: '{!r}'".format(line))
-                futures.append(loop.run_in_executor(pool, self.search, line))
+                query = line.decode().strip()
+                futures.append(loop.run_in_executor(pool, self.search, query))
+                print("[ ] checking line: '{}'".format(query))
             
             if not futures:
                 print("[-] No data received from {}".format(remote_addr))
-
             done,_ = await asyncio.wait(futures)
 
         for task in done:
@@ -82,15 +83,15 @@ class SearchHandler():
         writer.close()
 
 
-    def search(self, data: ByteString) -> ByteString:
-        query = data.decode().strip().split(" ")
+    def search(self, data: str) -> ByteString:
+        query = data.split(" ")
         query[-1] = query[-1][:3]  # cut down on the last item which should be the version number
         output = []
         for rows in self.db:
             if all([term in rows["description"] for term in query]):
                 output.append("\t".join((rows["description"], rows["file"])))
         if output:
-            return ("[+] {}\n".format(data.decode().strip()) + "\n".join(output)).encode()
+            return ("[+] {}\n".format(data) + "\n".join(output)).encode()
         return b''
 
 
